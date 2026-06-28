@@ -1,0 +1,11 @@
+.venv/
+paper-analyzer/
+.python/
+**__pycache__/
+**pycache**/
+*.pyc
+.env
+.streamlit/secrets.toml
+outputs/
+models/
+*.npy
