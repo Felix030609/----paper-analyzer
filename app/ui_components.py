@@ -1330,6 +1330,9 @@ def render_evidence_chain(label_results: list[dict[str, Any]]) -> None:
                         "chunk_index": evidence.get("chunk_index", ""),
                         "section_title": evidence.get("section_title", ""),
                         "similarity": evidence.get("similarity_score", evidence.get("similarity", "")),
+                        "quality_score": evidence.get("quality_score", ""),
+                        "raw_text_reference": evidence.get("raw_text_reference", ""),
+                        "cleaned": True,
                     }
                     for evidence in retrieved_items
                 ]
@@ -1355,18 +1358,25 @@ def render_evidence_chain(label_results: list[dict[str, Any]]) -> None:
                     chunk_meta = f"｜chunk {evidence.get('chunk_index')}" if evidence.get("chunk_index") not in ("", None) else ""
                     section_meta = f"｜{evidence.get('section_title')}" if evidence.get("section_title") else ""
                     similarity_meta = f"｜相似度 {evidence.get('similarity')}" if evidence.get("similarity") not in ("", None) else ""
+                    quality_meta = f"｜质量分 {evidence.get('quality_score')}" if evidence.get("quality_score") not in ("", None, "") else ""
                     st.markdown(
                         f"""
                         <div class="evidence-card">
-                          <div class="summary-label">原文证据 {index}{html_lib.escape(section_meta)}{html_lib.escape(chunk_meta)}{html_lib.escape(similarity_meta)}</div>
+                          <div class="summary-label">原文证据 {index}{html_lib.escape(section_meta)}{html_lib.escape(chunk_meta)}{html_lib.escape(similarity_meta)}{html_lib.escape(quality_meta)}</div>
                           <div class="evidence-block">{html_lib.escape(preview)}</div>
                         </div>
                         """,
                         unsafe_allow_html=True,
                     )
+                    if evidence.get("cleaned"):
+                        st.caption("该证据为 PDF/TXT 提取文本清洗后的片段，已尽量去除页眉、页脚和乱码符号。")
                     if has_more:
                         with st.expander("查看完整证据", expanded=False):
                             st.write(text)
+                    raw_reference = str(evidence.get("raw_text_reference") or "").strip()
+                    if raw_reference and raw_reference != str(text).strip():
+                        with st.expander("查看原始提取文本", expanded=False):
+                            st.write(raw_reference)
                     reason = evidence.get("reason") or item.get("reason")
                     if reason:
                         st.markdown(

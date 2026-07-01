@@ -48,6 +48,7 @@ from scripts.report_export import markdown_to_pdf_bytes  # noqa: E402
 from scripts.text_preprocessing import (  # noqa: E402
     build_cleaned_document,
     extract_raw_text_from_file,
+    extract_text_with_multiple_backends,
 )
 from scripts.usage_logger import log_event, read_usage_events, usage_summary  # noqa: E402
 
@@ -234,6 +235,10 @@ def parse_uploaded_file(uploaded_file) -> str:
     return extract_raw_text_from_file(uploaded_file)
 
 
+def parse_uploaded_file_with_metadata(uploaded_file) -> dict[str, Any]:
+    return extract_text_with_multiple_backends(uploaded_file)
+
+
 def uploaded_file_size(uploaded_file) -> int:
     size = getattr(uploaded_file, "size", None)
     if isinstance(size, int):
@@ -340,6 +345,7 @@ def set_running_state(
     model_name: str,
     estimated_time: str,
     file_type: str,
+    extraction_metadata: dict[str, Any] | None = None,
 ) -> None:
     selected_labels = QUICK_TEST_LABELS if quick_test_mode else None
     st.session_state.analysis_status = "running"
@@ -369,6 +375,7 @@ def set_running_state(
         "model_name": model_name,
         "estimated_time": estimated_time,
         "file_type": file_type,
+        "extraction_metadata": extraction_metadata or {},
         "started_at": time.time(),
     }
     st.rerun()
@@ -643,7 +650,8 @@ def render_upload_card(label_definitions: list[dict[str, Any]]) -> None:
             return
 
         try:
-            raw_text = parse_uploaded_file(uploaded_file)
+            extraction_result = parse_uploaded_file_with_metadata(uploaded_file)
+            raw_text = str(extraction_result.get("raw_text") or "")
         except ValueError as exc:
             st.error(str(exc))
             st.markdown("</div>", unsafe_allow_html=True)
@@ -651,8 +659,27 @@ def render_upload_card(label_definitions: list[dict[str, Any]]) -> None:
 
         original_text_length = len(raw_text)
         preview_text = raw_text[:MAX_ANALYSIS_CHARS]
+        backend = str(extraction_result.get("backend") or "unknown")
+        backend_scores = extraction_result.get("backend_scores") or {}
+        selected_quality = None
+        backend_quality = extraction_result.get("backend_quality") or {}
+        if backend in backend_quality:
+            selected_quality = backend_quality[backend].get("quality_score")
         estimated_time = estimate_analysis_time(selected_model_name, quick_test_mode, original_text_length)
         st.caption(f"已提取约 {original_text_length} 个字符。")
+        if backend != "unknown":
+            st.caption(f"PDF/TXT 解析后端：{backend}；质量分：{selected_quality if selected_quality is not None else '待评估'}")
+        if selected_quality is not None and int(selected_quality) < 60:
+            st.warning("PDF 提取质量较低，建议上传 TXT / Word / 可复制文本版，或启用增强清洗。")
+        if backend_scores:
+            with st.expander("查看解析质量诊断", expanded=False):
+                st.json(
+                    {
+                        "backend": backend,
+                        "backend_scores": backend_scores,
+                        "warnings": extraction_result.get("warnings", []),
+                    }
+                )
         if original_text_length > MAX_ANALYSIS_CHARS:
             st.warning(f"当前 V0 为控制成本，仅分析前 {MAX_ANALYSIS_CHARS:,} 字。")
         if estimated_time != base_estimated_time:
@@ -692,6 +719,12 @@ def render_upload_card(label_definitions: list[dict[str, Any]]) -> None:
                 model_name=selected_model_name,
                 estimated_time=estimated_time,
                 file_type=file_type,
+                extraction_metadata={
+                    "backend": backend,
+                    "backend_scores": backend_scores,
+                    "backend_quality": backend_quality,
+                    "warnings": extraction_result.get("warnings", []),
+                },
             )
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -905,11 +938,8 @@ def render_analysis_tabs(
 
 
 def render_cleaning_summary(result: dict[str, Any]) -> None:
-    if not result.get("use_enhanced_cleaning"):
-        return
     summary = result.get("cleaning_summary") or {}
     if not summary:
-        st.info("已启用增强文本清洗，但暂无可展示的清洗摘要。")
         return
 
     method_map = {
@@ -921,11 +951,19 @@ def render_cleaning_summary(result: dict[str, Any]) -> None:
     cols = st.columns(3)
     metrics = [
         ("清洗方式", method_map.get(str(summary.get("cleaning_method")), str(summary.get("cleaning_method") or "未知"))),
+        ("解析后端", summary.get("backend") or "未知"),
+        ("原始质量分", summary.get("raw_quality_score", "待评估")),
+        ("清洗后质量分", summary.get("cleaned_quality_score", "待评估")),
         ("原始文本字数", summary.get("raw_text_length", 0)),
         ("清洗后字数", summary.get("cleaned_text_length", 0)),
         ("删除噪声", summary.get("removed_noise_count", 0)),
+        ("页眉页脚", summary.get("removed_header_footer_count", 0)),
+        ("乱码字符", summary.get("garbled_char_count_before", 0)),
         ("疑似脚注", summary.get("possible_footnotes_count", 0)),
         ("疑似参考文献", summary.get("possible_references_count", 0)),
+        ("参考文献字数", summary.get("references_text_length", 0)),
+        ("进入 RAG chunk", result.get("chunk_count", 0)),
+        ("过滤 chunk", result.get("filtered_chunk_count", 0)),
         ("清洗警告", summary.get("warnings_count", 0)),
     ]
     for index, (label, value) in enumerate(metrics):
@@ -966,59 +1004,55 @@ def run_pending_analysis(running_slots: dict[str, Any] | None = None) -> None:
         raw_for_analysis = raw_text[:MAX_ANALYSIS_CHARS]
         analysis_text = raw_for_analysis
         cleaning_summary: dict[str, Any] | None = None
-
-        if use_enhanced_cleaning:
-            update_progress_state(
-                {
-                    "progress": 0.04,
-                    "status": "正在进行增强文本清洗与结构识别",
-                    "stage": "text_preprocessing",
-                    "total": st.session_state.get("total_labels", 0),
-                },
-                running_slots,
+        update_progress_state(
+            {
+                "progress": 0.04,
+                "status": "正在进行文本清洗与结构识别" if use_enhanced_cleaning else "正在进行规则文本清洗",
+                "stage": "text_preprocessing",
+                "total": st.session_state.get("total_labels", 0),
+            },
+            running_slots,
+        )
+        try:
+            cleaning_result = build_cleaned_document(
+                raw_for_analysis,
+                use_llm_cleaning=use_enhanced_cleaning,
+                model_name=str(pending.get("model_name") or get_deepseek_model()),
+                extraction_metadata=pending.get("extraction_metadata") or {},
             )
-            try:
-                cleaning_result = build_cleaned_document(
-                    raw_for_analysis,
-                    use_llm_cleaning=True,
-                    model_name=str(pending.get("model_name") or get_deepseek_model()),
-                )
-                cleaning_summary = cleaning_result.to_summary()
-                cleaning_summary["raw_text_length"] = len(raw_text)
-                if len(raw_text) > MAX_ANALYSIS_CHARS:
-                    warnings = list(cleaning_summary.get("warnings") or [])
-                    warnings.append(f"当前 V0 为控制成本，仅对前 {MAX_ANALYSIS_CHARS:,} 字进行清洗和分析。")
-                    cleaning_summary["warnings"] = warnings[:8]
-                    cleaning_summary["warnings_count"] = int(cleaning_summary.get("warnings_count", 0) or 0) + 1
-                analysis_text = (cleaning_result.cleaned_text or "").strip()
-                if not analysis_text:
-                    raise ValueError("文本清洗后正文为空。")
-                if len(analysis_text) > MAX_ANALYSIS_CHARS:
-                    analysis_text = analysis_text[:MAX_ANALYSIS_CHARS]
-            except Exception as exc:
-                print(f"增强文本清洗失败，已回退到原始文本：{exc}", flush=True)
-                cleaning_summary = {
-                    "cleaning_method": "raw_fallback",
-                    "raw_text_length": len(raw_text),
-                    "cleaned_text_length": len(raw_for_analysis),
-                    "block_count": 0,
-                    "removed_noise_count": 0,
-                    "possible_footnotes_count": 0,
-                    "possible_references_count": 0,
-                    "warnings_count": 1,
-                    "warnings": [f"增强文本清洗失败，已回退到原始文本：{exc}"],
-                }
-                analysis_text = raw_for_analysis
-        else:
-            update_progress_state(
-                {
-                    "progress": 0.04,
-                    "status": "正在准备正文",
-                    "stage": "prepare_text",
-                    "total": st.session_state.get("total_labels", 0),
-                },
-                running_slots,
-            )
+            cleaning_summary = cleaning_result.to_summary()
+            cleaning_summary["raw_text_length"] = len(raw_text)
+            if len(raw_text) > MAX_ANALYSIS_CHARS:
+                warnings = list(cleaning_summary.get("warnings") or [])
+                warnings.append(f"当前 V0 为控制成本，仅对前 {MAX_ANALYSIS_CHARS:,} 字进行清洗和分析。")
+                cleaning_summary["warnings"] = warnings[:10]
+                cleaning_summary["warnings_count"] = int(cleaning_summary.get("warnings_count", 0) or 0) + 1
+            analysis_text = (cleaning_result.cleaned_text or "").strip()
+            if not analysis_text:
+                raise ValueError("文本清洗后正文为空。")
+            if len(analysis_text) > MAX_ANALYSIS_CHARS:
+                analysis_text = analysis_text[:MAX_ANALYSIS_CHARS]
+        except Exception as exc:
+            print(f"文本清洗失败，已回退到原始文本：{exc}", flush=True)
+            cleaning_summary = {
+                "cleaning_method": "raw_fallback",
+                "raw_text_length": len(raw_text),
+                "cleaned_text_length": len(raw_for_analysis),
+                "block_count": 0,
+                "backend": (pending.get("extraction_metadata") or {}).get("backend", ""),
+                "backend_scores": (pending.get("extraction_metadata") or {}).get("backend_scores", {}),
+                "raw_quality_score": None,
+                "cleaned_quality_score": None,
+                "garbled_char_count_before": 0,
+                "removed_noise_count": 0,
+                "removed_header_footer_count": 0,
+                "possible_footnotes_count": 0,
+                "possible_references_count": 0,
+                "references_text_length": 0,
+                "warnings_count": 1,
+                "warnings": [f"文本清洗失败，已回退到原始文本：{exc}"],
+            }
+            analysis_text = raw_for_analysis
 
         result = analyze_text(
             analysis_text,
@@ -1034,6 +1068,7 @@ def run_pending_analysis(running_slots: dict[str, Any] | None = None) -> None:
         result["upload_file_size"] = pending.get("upload_file_size", 0)
         result["original_text_length"] = pending.get("original_text_length", len(raw_text))
         result["use_enhanced_cleaning"] = use_enhanced_cleaning
+        result["text_cleaning_enabled"] = True
         if cleaning_summary:
             result["cleaning_summary"] = cleaning_summary
         duration_seconds = round(time.time() - float(pending.get("started_at") or time.time()), 2)

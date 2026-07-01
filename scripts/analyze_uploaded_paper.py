@@ -16,6 +16,7 @@ from scripts.deepseek_client import (
     get_deepseek_api_key,
     get_deepseek_model,
 )
+from scripts.text_preprocessing import CNKI_NOISE_RE, evaluate_text_quality, count_chinese
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -235,11 +236,39 @@ def detect_section_title(text: str) -> str:
     return ""
 
 
-def build_text_chunks(text: str) -> list[dict[str, Any]]:
+def is_probable_section_title(text: str) -> bool:
+    stripped = str(text).strip()
+    return bool(
+        stripped
+        and len(stripped) <= 50
+        and re.match(
+            r"^(\[.*?\]\s*)?(摘要|关键词|引言|导论|结语|结论|第[一二三四五六七八九十\d]+[章节]|[一二三四五六七八九十]+、|\d+[.、])",
+            stripped,
+        )
+    )
+
+
+def is_reference_or_noise_paragraph(text: str) -> bool:
+    stripped = str(text).strip()
+    if not stripped:
+        return True
+    if stripped.startswith(("[可能参考文献]", "[参考文献/注释区域]")):
+        return True
+    if CNKI_NOISE_RE.search(stripped):
+        return True
+    if re.search(r"^\s*(参考文献|References|Bibliography|Notes|注释)\s*$", stripped, re.I):
+        return True
+    if re.search(r"DOI\s*[:：]?\s*10\.\d+", stripped, re.I):
+        return True
+    return False
+
+
+def build_text_chunks(text: str, return_stats: bool = False):
     paragraphs = split_paragraphs(text)
     chunks: list[dict[str, Any]] = []
+    filtered_count = 0
     cursor = 0
-    for index, paragraph in enumerate(paragraphs, start=1):
+    for source_index, paragraph in enumerate(paragraphs, start=1):
         probe = paragraph[:80]
         start_char = text.find(probe, cursor) if probe else -1
         if start_char < 0:
@@ -247,24 +276,49 @@ def build_text_chunks(text: str) -> list[dict[str, Any]]:
         end_char = min(start_char + len(paragraph), len(text))
         cursor = max(end_char, cursor)
         section_title = detect_section_title(paragraph)
-        is_body = not paragraph.startswith(("[可能参考文献]", "[参考文献/注释区域]"))
-        warnings: list[str] = []
-        if not is_body:
-            warnings.append("该 chunk 可能属于参考文献或注释区域。")
+        quality = evaluate_text_quality(paragraph)
+        warnings: list[str] = list(quality.get("warnings", []))
+        is_reference = is_reference_or_noise_paragraph(paragraph)
+        is_title = is_probable_section_title(paragraph) or bool(section_title)
+        effective_chinese_count = count_chinese(paragraph)
+        quality_score = int(quality.get("quality_score", 0) or 0)
+        is_body = not is_reference
+        should_filter = False
+        if is_reference:
+            warnings.append("该段落可能属于参考文献、DOI、CNKI 页脚或出版信息。")
+            should_filter = True
+        if quality_score < 45:
+            warnings.append("该段落文本质量较低，已从 RAG 中过滤。")
+            should_filter = True
+        if effective_chinese_count < 50 and not is_title:
+            warnings.append("该段落有效中文正文过少，已从 RAG 中过滤。")
+            should_filter = True
+        if should_filter:
+            filtered_count += 1
+            continue
+
         chunks.append(
             {
-                "chunk_id": f"C{index:03d}",
-                "chunk_index": index,
+                "chunk_id": f"C{len(chunks) + 1:03d}",
+                "chunk_index": len(chunks) + 1,
+                "source_paragraph_index": source_index,
                 "cleaned_text": paragraph,
                 "raw_text_reference": paragraph,
                 "section_title": section_title,
                 "start_char": start_char,
                 "end_char": end_char,
                 "is_body": is_body,
+                "is_reference": is_reference,
+                "quality_score": quality_score,
                 "warnings": warnings,
             }
         )
-    return chunks
+    stats = {
+        "source_paragraph_count": len(paragraphs),
+        "chunk_count": len(chunks),
+        "filtered_chunk_count": filtered_count,
+    }
+    return (chunks, stats) if return_stats else chunks
 
 
 def load_embedding_model() -> SentenceTransformer:
@@ -300,6 +354,8 @@ def retrieve_label_evidence(
                 "start_char": chunk.get("start_char"),
                 "end_char": chunk.get("end_char"),
                 "is_body": bool(chunk.get("is_body", True)),
+                "is_reference": bool(chunk.get("is_reference", False)),
+                "quality_score": chunk.get("quality_score"),
                 "warnings": chunk.get("warnings", []),
                 "raw_text_reference": shorten_text(str(chunk.get("raw_text_reference") or full_text), MAX_VISIBLE_EVIDENCE_CHARS),
                 "similarity": round(float(similarities[index]), 4),
@@ -513,7 +569,7 @@ def analyze_text(
         status="正在切分段落",
         stage="split_paragraphs",
     )
-    chunks = build_text_chunks(text)
+    chunks, chunk_stats = build_text_chunks(text, return_stats=True)
     if not chunks:
         raise ValueError("未能从正文中切分出有效段落。")
     paragraphs = [chunk["cleaned_text"] for chunk in chunks]
@@ -609,6 +665,8 @@ def analyze_text(
         "text_truncated": truncated,
         "paragraph_count": len(paragraphs),
         "chunk_count": len(chunks),
+        "source_paragraph_count": chunk_stats.get("source_paragraph_count", len(paragraphs)),
+        "filtered_chunk_count": chunk_stats.get("filtered_chunk_count", 0),
         "label_count": total_labels,
         "selected_label_names": selected_label_names,
         "label_results": label_results,
