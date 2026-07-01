@@ -584,9 +584,10 @@ def render_hero() -> None:
             上传中文人文社科论文，系统将从方法论、哲学资源、文学观与政治—美学倾向四个层面生成结构化分析。
           </div>
           <div>
-            <span class="badge">19 个思想标签</span>
-            <span class="badge">RAG 证据召回</span>
-            <span class="badge">DeepSeek 自动报告生成</span>
+            <span class="badge">思想标签分析</span>
+            <span class="badge">原文证据支撑</span>
+            <span class="badge">学术谱系可视化</span>
+            <span class="badge">结构化报告导出</span>
           </div>
           <div class="warning-box">
             本工具只分析论文文本中呈现出的思想倾向，不判断作者本人真实政治立场。
@@ -1295,17 +1296,17 @@ def truncate_text(text: str, limit: int = 800) -> tuple[str, bool]:
 
 
 def render_evidence_chain(label_results: list[dict[str, Any]]) -> None:
-    st.markdown("### 核心标签证据链")
-    st.caption("证据链基于语义召回生成，每个标签展示与其定义最相关的原文段落。分数越高，说明该标签在当前文本中的支撑越强。")
+    st.markdown("### 原文证据")
+    st.caption("以下证据摘录来自论文原文，用于说明各项判断。系统已尽量过滤页眉、页脚、乱码与参考文献干扰，证据内容仍建议结合原文复核。")
     core_results = [item for item in label_results if get_score(item) >= 2]
     if not core_results:
-        st.info("暂无分数 >= 2 的核心标签证据链。")
+        st.info("暂无可展示的核心证据。")
         return
 
     for item in sorted(core_results, key=lambda value: get_score(value), reverse=True):
         score = int(get_score(item))
         confidence = item.get("confidence", "待复核")
-        title = f"{item.get('label_name')}｜{score}/3｜置信度 {confidence}"
+        title = f"{item.get('label_name')}｜核心证据"
         with st.expander(title, expanded=score >= 3):
             evidence_items = item.get("evidence_items") or []
             retrieved_items = item.get("retrieved_paragraphs") or []
@@ -1338,7 +1339,7 @@ def render_evidence_chain(label_results: list[dict[str, Any]]) -> None:
                         or build_evidence_excerpt(evidence.get("full_text") or evidence.get("evidence_full_text") or evidence.get("text", "")),
                         "full_text": evidence.get("full_text") or evidence.get("evidence_full_text") or evidence.get("text", ""),
                         "reason": item.get("reason"),
-                        "evidence_type": "语义召回段落",
+                        "evidence_type": "原文证据",
                         "confidence": confidence,
                         "chunk_index": evidence.get("chunk_index", ""),
                         "source_chunk_id": evidence.get("source_chunk_id") or evidence.get("chunk_id", ""),
@@ -1360,7 +1361,7 @@ def render_evidence_chain(label_results: list[dict[str, Any]]) -> None:
                         "excerpt_text": build_evidence_excerpt(text),
                         "full_text": str(text),
                         "reason": item.get("reason"),
-                        "evidence_type": "模型摘录",
+                        "evidence_type": "原文摘录",
                         "confidence": confidence,
                         "chunk_index": "",
                         "similarity": "",
@@ -1370,59 +1371,59 @@ def render_evidence_chain(label_results: list[dict[str, Any]]) -> None:
 
             if display_items:
                 if len(display_items) == 1 and len(retrieved_items) == 0:
-                    st.caption("当前标签只召回到 1 条可展示证据。可提高 top_k 或切换 V4 Pro 重新分析。")
+                    st.caption("当前标签暂时只有 1 条可展示证据。可选择深度分析或增加证据数量后重新分析。")
                 for index, evidence in enumerate(display_items, start=1):
                     excerpt = str(evidence.get("excerpt_text") or "").strip()
                     full_text = str(evidence.get("full_text") or "").strip()
-                    chunk_meta = f"｜chunk {evidence.get('chunk_index')}" if evidence.get("chunk_index") not in ("", None) else ""
-                    section_meta = f"｜{evidence.get('section_title')}" if evidence.get("section_title") else ""
-                    similarity_meta = f"｜相似度 {evidence.get('similarity')}" if evidence.get("similarity") not in ("", None) else ""
-                    quality_meta = f"｜质量分 {evidence.get('quality_score')}" if evidence.get("quality_score") not in ("", None, "") else ""
+                    evidence_title = f"证据 {index}｜{evidence.get('label_name') or item.get('label_name', '')}｜核心证据"
                     st.markdown(
                         f"""
                         <div class="evidence-card">
-                          <div class="summary-label">{html_lib.escape(str(evidence.get("evidence_id") or f"E{index}"))}｜{html_lib.escape(str(evidence.get("label_name") or item.get("label_name", "")))}｜{int(evidence.get("score") or score)}/3{html_lib.escape(section_meta)}{html_lib.escape(chunk_meta)}{html_lib.escape(similarity_meta)}{html_lib.escape(quality_meta)}</div>
-                          <div class="evidence-block">{html_lib.escape(excerpt)}</div>
+                          <div class="summary-label">{html_lib.escape(evidence_title)}</div>
+                          <div class="evidence-block"><strong>证据摘录：</strong><br>{html_lib.escape(excerpt)}</div>
                         </div>
                         """,
                         unsafe_allow_html=True,
                     )
-                    if evidence.get("cleaned"):
-                        st.caption("该证据为 PDF/TXT 提取文本清洗后的片段，已尽量去除页眉、页脚和乱码符号。")
-                    if full_text and full_text != excerpt:
-                        with st.expander("查看完整证据", expanded=False):
-                            st.write(full_text)
-                            meta_items = []
-                            if evidence.get("source_chunk_id"):
-                                meta_items.append(f"chunk_id：{evidence.get('source_chunk_id')}")
-                            if evidence.get("page") not in ("", None):
-                                meta_items.append(f"页码：{evidence.get('page')}")
-                            if evidence.get("section_title"):
-                                meta_items.append(f"章节：{evidence.get('section_title')}")
-                            if meta_items:
-                                st.caption("；".join(meta_items))
-                    raw_reference = str(evidence.get("raw_text_reference") or "").strip()
-                    if raw_reference and raw_reference != full_text:
-                        with st.expander("查看原始提取文本", expanded=False):
-                            st.write(raw_reference)
                     reason = evidence.get("reason") or item.get("reason")
                     if reason:
                         st.markdown(
-                            f'<div class="evidence-reason"><strong>判断理由：</strong>{html_lib.escape(str(reason))}</div>',
+                            f'<div class="evidence-reason"><strong>判断说明：</strong>{html_lib.escape(str(reason))}</div>',
                             unsafe_allow_html=True,
                         )
-                    st.markdown(
-                        f"""
-                        <span class="evidence-meta">{evidence.get("evidence_type", "证据")}</span>
-                        <span class="evidence-meta">置信度 {evidence.get("confidence", confidence)}</span>
-                        """,
-                        unsafe_allow_html=True,
-                    )
+                    if full_text and full_text != excerpt:
+                        with st.expander("查看完整证据", expanded=False):
+                            st.write(full_text)
+                    raw_reference = str(evidence.get("raw_text_reference") or "").strip()
+                    with st.expander("查看技术细节", expanded=False):
+                        detail_rows = []
+                        if evidence.get("source_chunk_id"):
+                            detail_rows.append(("证据片段编号", evidence.get("source_chunk_id")))
+                        if evidence.get("chunk_index") not in ("", None):
+                            detail_rows.append(("片段序号", evidence.get("chunk_index")))
+                        if evidence.get("similarity") not in ("", None):
+                            detail_rows.append(("系统匹配度", evidence.get("similarity")))
+                        if evidence.get("quality_score") not in ("", None, ""):
+                            detail_rows.append(("文本质量分", evidence.get("quality_score")))
+                        if evidence.get("confidence") not in ("", None, ""):
+                            detail_rows.append(("模型置信度", evidence.get("confidence", confidence)))
+                        if evidence.get("page") not in ("", None):
+                            detail_rows.append(("页码", evidence.get("page")))
+                        if evidence.get("section_title"):
+                            detail_rows.append(("章节", evidence.get("section_title")))
+                        if detail_rows:
+                            st.table(
+                                [{"字段": label, "值": value} for label, value in detail_rows]
+                            )
+                        if raw_reference and raw_reference != full_text:
+                            st.markdown("**原始提取文本**")
+                            st.write(raw_reference)
             else:
-                st.info("当前标签未召回到足够证据，建议提高 top_k 或切换 V4 Pro 重新分析。")
+                st.info("当前标签暂未找到足够清晰的原文证据。可增加证据数量或选择深度分析后重新分析。")
             uncertainty = str(item.get("uncertainty") or "").strip()
             if uncertainty:
-                st.caption(f"不确定性：{uncertainty}")
+                with st.expander("查看判断边界", expanded=False):
+                    st.write(uncertainty)
 
 
 def render_report(report_markdown: str | None) -> None:

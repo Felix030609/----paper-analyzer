@@ -99,7 +99,7 @@ def normalize_label_result(
         "score": score,
         "confidence": clamp_int(raw.get("confidence"), 1, 5, 1),
         "evidence": [str(item).strip() for item in evidence[:3] if str(item).strip()],
-        "reason": str(raw.get("reason", "")).strip() or "DeepSeek 未返回明确理由。",
+        "reason": str(raw.get("reason", "")).strip() or "暂未返回明确理由。",
         "uncertainty": str(raw.get("uncertainty", "")).strip() or "需要人工复核。",
         "retrieved_paragraphs": normalized_retrieved,
     }
@@ -115,8 +115,8 @@ def fallback_label_result(
             "score": 0,
             "confidence": 1,
             "evidence": [],
-            "reason": f"该标签自动评分失败：{message}",
-            "uncertainty": "需要人工复核该标签。DeepSeek 调用或 JSON 解析未成功。",
+            "reason": f"该标签自动判断未完成：{message}",
+            "uncertainty": "需要人工复核该标签。",
         },
         label_definition,
         retrieved,
@@ -132,7 +132,7 @@ def timeout_label_result(
             "score": 0,
             "confidence": 1,
             "evidence": [],
-            "reason": "DeepSeek 请求超时，未完成该标签分析",
+            "reason": "分析服务响应超时，未完成该标签判断",
             "uncertainty": "该标签需要重新分析",
         },
         label_definition,
@@ -495,15 +495,19 @@ def generate_markdown_report(
             "label_name": item["label_name"],
             "category": item["category"],
             "score": item["score"],
-            "confidence": item["confidence"],
-            "evidence": report_evidence_for_label(item),
+            "evidence_excerpts": report_evidence_for_label(item),
             "reason": shorten_text(item.get("reason", ""), MAX_REPORT_REASON_CHARS),
             "uncertainty": shorten_text(item.get("uncertainty", ""), 300),
         }
         for item in label_results
     ]
     prompt = f"""
-请基于以下标签评分和证据，为论文《{title}》生成一份中文 Markdown 结构化分析报告。
+请为论文《{title}》生成一份面向人文社科论文阅读者的中文 Markdown 阅读辅助报告。
+
+报告开头请使用自然的学术表达，例如：
+“本文围绕《{title}》展开结构化分析，重点考察其方法论路径、理论资源、文学观与政治—美学倾向。根据原文证据，本文主要呈现出……”
+
+请不要在报告中提及系统内部流程、技术实现、模型运行或数据格式等内容。
 
 必须包含以下章节：
 1. 论文核心问题
@@ -519,9 +523,9 @@ def generate_markdown_report(
 产品边界声明必须明确写出：
 本工具只分析论文文本中呈现出的思想倾向，不判断作者本人真实政治立场。
 
-证据引用只能使用提供的 250 字以内 evidence 摘录，不要扩写为完整 chunk，也不要补写原文没有的内容。
+证据引用只能使用提供的 250 字以内证据摘录，不要扩写为完整段落，也不要补写原文没有的内容。
 
-标签分析结果：
+分析材料：
 {json.dumps(compact_results, ensure_ascii=False, indent=2)}
 """.strip()
 
@@ -530,7 +534,7 @@ def generate_markdown_report(
             [
                 {
                     "role": "system",
-                    "content": "你是严谨的人文社科论文分析助手，输出中文 Markdown 报告。",
+                    "content": "你是严谨的人文社科论文阅读助手，输出自然、克制、面向读者的中文 Markdown 报告。",
                 },
                 {"role": "user", "content": prompt},
             ],
@@ -553,20 +557,20 @@ def build_fallback_report(
         f"# {title} 思想谱系分析报告",
         "",
         "## 生成状态",
-        f"DeepSeek 报告生成失败：{message}",
+        f"完整报告暂未生成：{message}",
         "",
         "## 高分标签",
     ]
     if high_scores:
         for item in high_scores:
-            lines.append(f"- {item['label_name']}：{item['score']} 分，置信度 {item['confidence']}")
+            lines.append(f"- {item['label_name']}：{item['score']} 分")
     else:
         lines.append("- 暂无分数 >= 2 的标签，或自动评分未成功。")
     lines.extend(
         [
             "",
             "## 不确定性说明",
-            "该报告为降级结果，仅供检查流程使用。请配置并确认 DeepSeek API 可用后重新生成。",
+            "该报告为临时结果，建议稍后重新生成，并结合原文证据人工复核。",
             "",
             "## 产品边界声明",
             "本工具只分析论文文本中呈现出的思想倾向，不判断作者本人真实政治立场。",
@@ -595,7 +599,7 @@ def analyze_text(
     emit_progress(
         progress_callback,
         progress=0.04,
-        status="正在清洗文本",
+        status="正在整理正文",
         stage="clean_text",
     )
     text, truncated, source_char_count = trim_text_for_analysis(text)
@@ -606,7 +610,7 @@ def analyze_text(
     emit_progress(
         progress_callback,
         progress=0.08,
-        status="正在切分段落",
+        status="正在划分证据片段",
         stage="split_paragraphs",
     )
     chunks, chunk_stats = build_text_chunks(text, return_stats=True)
@@ -618,14 +622,14 @@ def analyze_text(
     emit_progress(
         progress_callback,
         progress=0.14,
-        status="正在加载 embedding 模型",
+        status="正在准备分析组件",
         stage="load_embedding_model",
     )
     model = load_embedding_model()
     emit_progress(
         progress_callback,
         progress=0.20,
-        status="正在生成段落 embedding",
+        status="正在建立原文索引",
         stage="build_embeddings",
     )
     paragraph_embeddings = model.encode(
@@ -643,7 +647,7 @@ def analyze_text(
         emit_progress(
             progress_callback,
             progress=loop_base,
-            status=f"正在召回标签证据：第 {index}/{total_labels} 个标签，标签名 {label_name}",
+            status=f"正在提取原文证据：第 {index}/{total_labels} 个标签，标签名 {label_name}",
             stage="retrieve_evidence",
             current=index,
             total=total_labels,
@@ -662,7 +666,7 @@ def analyze_text(
         emit_progress(
             progress_callback,
             progress=loop_base + 0.02,
-            status=f"正在调用 DeepSeek 分析：第 {index}/{total_labels} 个标签，标签名 {label_name}",
+            status=f"正在生成标签判断：第 {index}/{total_labels} 个标签，标签名 {label_name}",
             stage="deepseek_label",
             current=index,
             total=total_labels,
@@ -689,7 +693,7 @@ def analyze_text(
     emit_progress(
         progress_callback,
         progress=0.88,
-        status="正在生成最终报告",
+        status="正在生成分析报告",
         stage="generate_report",
     )
     report = generate_markdown_report(label_results, title=title, model_name=effective_model_name)
