@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import html as html_lib
 import sys
 import time
 import uuid
@@ -729,6 +730,144 @@ def render_upload_card(label_definitions: list[dict[str, Any]]) -> None:
     st.markdown("</div>", unsafe_allow_html=True)
 
 
+def label_score_value(item: dict[str, Any]) -> float:
+    try:
+        return float(item.get("score", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def top_label_names(label_results: list[dict[str, Any]], limit: int = 3) -> list[str]:
+    sorted_items = sorted(label_results, key=label_score_value, reverse=True)
+    return [str(item.get("label_name", "")).strip() for item in sorted_items[:limit] if label_score_value(item) > 0]
+
+
+def render_compact_analysis_summary(status: str) -> None:
+    result = st.session_state.get("analysis_result") or {}
+    file_name = st.session_state.get("uploaded_file_name") or result.get("title") or "已上传论文"
+    model = result.get("model") or st.session_state.get("selected_model_name") or get_deepseek_model()
+    mode = st.session_state.get("analysis_mode") or ("快速测试" if result.get("quick_test_mode") else "完整分析")
+    status_text = {
+        "running": "分析进行中",
+        "done": "分析已完成",
+        "error": "等待重新分析",
+    }.get(status, "当前分析")
+
+    st.markdown(
+        f"""
+        <div class="progress-card">
+          <div class="upload-title">当前分析</div>
+          <div class="subtle-text">文件：{html_lib.escape(str(file_name))}</div>
+          <div class="subtle-text">模型：{html_lib.escape(model_display_name(str(model)))}</div>
+          <div class="subtle-text">模式：{html_lib.escape(str(mode))}</div>
+          <div style="margin-top: 10px;"><span class="status-pill status-pill-done">{html_lib.escape(status_text)}</span></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if status == "running":
+        st.caption("分析进行中，请在左侧查看进度。")
+        st.button("开始分析", disabled=True, width="stretch")
+    else:
+        if st.button("重新上传论文 / 开始新的分析", type="primary", width="stretch"):
+            reset_analysis_state()
+
+
+def render_result_summary_card(result: dict[str, Any]) -> None:
+    label_results = result.get("label_results", [])
+    top_labels = top_label_names(label_results, limit=3)
+    top_text = "、".join(top_labels) if top_labels else "暂无高分标签"
+    paper_type = "中文人文社科论文"
+    if result.get("quick_test_mode"):
+        paper_type += "｜快速测试"
+    core_sentence = f"主要倾向：{top_text}"
+    st.markdown(
+        f"""
+        <div class="summary-card">
+          <div class="section-title">分析已完成</div>
+          <div class="subtle-text">论文类型：{html_lib.escape(paper_type)}</div>
+          <div style="margin-top: 10px;"><strong>{html_lib.escape(core_sentence)}</strong></div>
+          <div class="subtle-text" style="margin-top: 8px;">系统已生成标签评分、学术谱系定位、证据链和结构化报告。</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_analysis_results_tabs(result: dict[str, Any], label_definitions: list[dict[str, Any]]) -> None:
+    label_results = result.get("label_results", [])
+    paper_title = result.get("title", "用户上传论文")
+    tabs = st.tabs(["核心判断", "学术谱系图", "标签矩阵", "原文证据链", "完整报告", "导出"])
+    with tabs[0]:
+        render_summary_judgement_card(label_results, paper_title)
+        render_cleaning_summary(result)
+    with tabs[1]:
+        render_academic_space_map(
+            label_results,
+            label_definitions,
+            paper_title,
+            key="done_academic_space",
+        )
+    with tabs[2]:
+        render_label_matrix(label_results, label_definitions)
+        render_distribution_tab(label_results, label_definitions, key_prefix="done_distribution")
+    with tabs[3]:
+        render_evidence_chain(label_results)
+    with tabs[4]:
+        render_report(result.get("report_markdown") or "暂无完整报告。")
+    with tabs[5]:
+        render_export_tab(result)
+
+
+def render_idle_page(label_definitions: list[dict[str, Any]], meta: dict[str, Any], results: list[dict[str, Any]]) -> None:
+    left_col, right_col = st.columns([1.5, 1], gap="large")
+    with left_col:
+        render_hero()
+        if results:
+            render_summary_judgement_card(results, demo_paper_display_title(meta))
+            render_core_label_pills(results)
+        else:
+            st.info("暂无可渲染的示例论文数据。")
+    with right_col:
+        render_upload_card(label_definitions)
+
+    st.markdown('<div class="full-width-section">', unsafe_allow_html=True)
+    render_sample_analysis_full_width(meta, results, label_definitions)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_running_page() -> dict[str, Any]:
+    main_col, side_col = st.columns([1.5, 0.75], gap="large")
+    with main_col:
+        slots = render_running_panel()
+    with side_col:
+        render_compact_analysis_summary("running")
+    return slots
+
+
+def render_done_page(label_definitions: list[dict[str, Any]]) -> None:
+    result = st.session_state.get("analysis_result")
+    if not result:
+        st.warning("暂无分析结果，请重新上传论文。")
+        return
+    main_col, side_col = st.columns([1.5, 0.75], gap="large")
+    with main_col:
+        render_result_summary_card(result)
+        render_analysis_results_tabs(result, label_definitions)
+        if result.get("save_warning"):
+            st.warning(result["save_warning"])
+    with side_col:
+        render_compact_analysis_summary("done")
+
+
+def render_error_page() -> None:
+    main_col, side_col = st.columns([1.5, 0.75], gap="large")
+    with main_col:
+        render_error_panel()
+    with side_col:
+        render_compact_analysis_summary("error")
+
+
 def render_header_section(
     label_definitions: list[dict[str, Any]],
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -1214,8 +1353,19 @@ def main() -> None:
         st.error(f"标签配置读取失败：{exc}")
         return
 
-    meta, results = render_header_section(label_definitions)
-    running_slots = render_main_content(label_definitions, meta, results)
+    meta, results = demo_data(label_definitions)
+    status = st.session_state.get("analysis_status", "idle")
+    running_slots = None
+    if status == "idle":
+        render_idle_page(label_definitions, meta, results)
+    elif status == "running":
+        running_slots = render_running_page()
+    elif status == "done":
+        render_done_page(label_definitions)
+    elif status == "error":
+        render_error_page()
+    else:
+        reset_analysis_state()
     render_usage_admin_panel()
     run_pending_analysis(running_slots)
 
