@@ -222,6 +222,51 @@ def split_paragraphs(text: str) -> list[str]:
     return [paragraph for paragraph in chunks if len(paragraph) >= 80]
 
 
+def detect_section_title(text: str) -> str:
+    lines = [line.strip() for line in str(text).splitlines() if line.strip()]
+    if not lines:
+        return ""
+    first_line = lines[0]
+    if len(first_line) <= 40 and re.match(
+        r"^(\[.*?\]\s*)?(摘要|引言|导论|结语|结论|参考文献|注释|第[一二三四五六七八九十\d]+[章节]|[一二三四五六七八九十]+、|\d+[.、])",
+        first_line,
+    ):
+        return first_line
+    return ""
+
+
+def build_text_chunks(text: str) -> list[dict[str, Any]]:
+    paragraphs = split_paragraphs(text)
+    chunks: list[dict[str, Any]] = []
+    cursor = 0
+    for index, paragraph in enumerate(paragraphs, start=1):
+        probe = paragraph[:80]
+        start_char = text.find(probe, cursor) if probe else -1
+        if start_char < 0:
+            start_char = cursor
+        end_char = min(start_char + len(paragraph), len(text))
+        cursor = max(end_char, cursor)
+        section_title = detect_section_title(paragraph)
+        is_body = not paragraph.startswith(("[可能参考文献]", "[参考文献/注释区域]"))
+        warnings: list[str] = []
+        if not is_body:
+            warnings.append("该 chunk 可能属于参考文献或注释区域。")
+        chunks.append(
+            {
+                "chunk_id": f"C{index:03d}",
+                "chunk_index": index,
+                "cleaned_text": paragraph,
+                "raw_text_reference": paragraph,
+                "section_title": section_title,
+                "start_char": start_char,
+                "end_char": end_char,
+                "is_body": is_body,
+                "warnings": warnings,
+            }
+        )
+    return chunks
+
+
 def load_embedding_model() -> SentenceTransformer:
     return SentenceTransformer(MODEL_NAME)
 
@@ -229,6 +274,7 @@ def load_embedding_model() -> SentenceTransformer:
 def retrieve_label_evidence(
     label_definition: dict[str, Any],
     paragraphs: list[str],
+    chunks: list[dict[str, Any]],
     paragraph_embeddings: np.ndarray,
     model: SentenceTransformer,
     top_k: int = 5,
@@ -241,18 +287,29 @@ def retrieve_label_evidence(
     top_indices = np.argsort(similarities)[::-1][:candidate_k]
     final_indices = top_indices[: min(top_k, len(top_indices))]
 
-    return [
-        {
-            "rank": rank,
-            "chunk_index": int(index),
-            "similarity": round(float(similarities[index]), 4),
-            "similarity_score": round(float(similarities[index]), 4),
-            "text": shorten_text(paragraphs[index], MAX_EVIDENCE_CHARS),
-            "evidence_excerpt": shorten_text(paragraphs[index], MAX_EVIDENCE_CHARS),
-            "evidence_full_text": shorten_text(paragraphs[index], MAX_VISIBLE_EVIDENCE_CHARS),
-        }
-        for rank, index in enumerate(final_indices, start=1)
-    ]
+    results: list[dict[str, Any]] = []
+    for rank, index in enumerate(final_indices, start=1):
+        chunk = chunks[int(index)] if int(index) < len(chunks) else {}
+        full_text = str(chunk.get("cleaned_text") or paragraphs[index])
+        results.append(
+            {
+                "rank": rank,
+                "chunk_id": chunk.get("chunk_id") or f"C{int(index) + 1:03d}",
+                "chunk_index": int(chunk.get("chunk_index") or int(index) + 1),
+                "section_title": chunk.get("section_title", ""),
+                "start_char": chunk.get("start_char"),
+                "end_char": chunk.get("end_char"),
+                "is_body": bool(chunk.get("is_body", True)),
+                "warnings": chunk.get("warnings", []),
+                "raw_text_reference": shorten_text(str(chunk.get("raw_text_reference") or full_text), MAX_VISIBLE_EVIDENCE_CHARS),
+                "similarity": round(float(similarities[index]), 4),
+                "similarity_score": round(float(similarities[index]), 4),
+                "text": shorten_text(full_text, MAX_EVIDENCE_CHARS),
+                "evidence_excerpt": shorten_text(full_text, MAX_EVIDENCE_CHARS),
+                "evidence_full_text": shorten_text(full_text, MAX_VISIBLE_EVIDENCE_CHARS),
+            }
+        )
+    return results
 
 
 def parse_json_response(content: str) -> dict[str, Any]:
@@ -456,9 +513,10 @@ def analyze_text(
         status="正在切分段落",
         stage="split_paragraphs",
     )
-    paragraphs = split_paragraphs(text)
-    if not paragraphs:
+    chunks = build_text_chunks(text)
+    if not chunks:
         raise ValueError("未能从正文中切分出有效段落。")
+    paragraphs = [chunk["cleaned_text"] for chunk in chunks]
     print(f"总段落数：{len(paragraphs)}", flush=True)
 
     emit_progress(
@@ -499,6 +557,7 @@ def analyze_text(
         retrieved = retrieve_label_evidence(
             label_definition,
             paragraphs,
+            chunks,
             paragraph_embeddings,
             model,
             top_k=llm_top_k,
@@ -549,6 +608,7 @@ def analyze_text(
         "analyzed_char_count": len(text),
         "text_truncated": truncated,
         "paragraph_count": len(paragraphs),
+        "chunk_count": len(chunks),
         "label_count": total_labels,
         "selected_label_names": selected_label_names,
         "label_results": label_results,

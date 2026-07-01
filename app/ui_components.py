@@ -1328,6 +1328,7 @@ def render_evidence_chain(label_results: list[dict[str, Any]]) -> None:
                         "evidence_type": "语义召回段落",
                         "confidence": confidence,
                         "chunk_index": evidence.get("chunk_index", ""),
+                        "section_title": evidence.get("section_title", ""),
                         "similarity": evidence.get("similarity_score", evidence.get("similarity", "")),
                     }
                     for evidence in retrieved_items
@@ -1352,11 +1353,12 @@ def render_evidence_chain(label_results: list[dict[str, Any]]) -> None:
                     text = evidence.get("text", "")
                     preview, has_more = truncate_text(text)
                     chunk_meta = f"｜chunk {evidence.get('chunk_index')}" if evidence.get("chunk_index") not in ("", None) else ""
+                    section_meta = f"｜{evidence.get('section_title')}" if evidence.get("section_title") else ""
                     similarity_meta = f"｜相似度 {evidence.get('similarity')}" if evidence.get("similarity") not in ("", None) else ""
                     st.markdown(
                         f"""
                         <div class="evidence-card">
-                          <div class="summary-label">原文证据 {index}{html_lib.escape(chunk_meta)}{html_lib.escape(similarity_meta)}</div>
+                          <div class="summary-label">原文证据 {index}{html_lib.escape(section_meta)}{html_lib.escape(chunk_meta)}{html_lib.escape(similarity_meta)}</div>
                           <div class="evidence-block">{html_lib.escape(preview)}</div>
                         </div>
                         """,

@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-import pdfplumber
 import streamlit as st
 
 
@@ -46,6 +45,10 @@ from scripts.deepseek_client import (  # noqa: E402
     get_deepseek_model,
 )
 from scripts.report_export import markdown_to_pdf_bytes  # noqa: E402
+from scripts.text_preprocessing import (  # noqa: E402
+    build_cleaned_document,
+    extract_raw_text_from_file,
+)
 from scripts.usage_logger import log_event, read_usage_events, usage_summary  # noqa: E402
 
 
@@ -227,44 +230,8 @@ def demo_data(label_definitions: list[dict[str, Any]]) -> tuple[dict[str, Any], 
     return p001_metadata(papers, annotations), p001_label_results(annotations, evidence, label_definitions)
 
 
-def extract_pdf_text(uploaded_file) -> str:
-    try:
-        parts: list[str] = []
-        with pdfplumber.open(uploaded_file) as pdf:
-            for page_index, page in enumerate(pdf.pages, start=1):
-                text = page.extract_text() or ""
-                if text.strip():
-                    parts.append(f"[PDF第{page_index}页]\n{text.strip()}")
-        return "\n\n".join(parts).strip()
-    except Exception as exc:
-        raise ValueError("PDF 解析失败。请确认文件不是扫描图片版 PDF，或改用可复制文本的 PDF/TXT。") from exc
-
-
-def extract_txt_text(uploaded_file) -> str:
-    raw = uploaded_file.getvalue()
-    if not raw:
-        raise ValueError("TXT 文件为空。")
-
-    for encoding in ("utf-8-sig", "utf-8", "gb18030"):
-        try:
-            return raw.decode(encoding).strip()
-        except UnicodeDecodeError:
-            continue
-    raise ValueError("TXT 编码无法识别。请保存为 UTF-8 后重新上传。")
-
-
 def parse_uploaded_file(uploaded_file) -> str:
-    suffix = Path(uploaded_file.name).suffix.lower()
-    if suffix == ".pdf":
-        text = extract_pdf_text(uploaded_file)
-    elif suffix == ".txt":
-        text = extract_txt_text(uploaded_file)
-    else:
-        raise ValueError("仅支持 PDF 或 TXT 文件。")
-
-    if not text:
-        raise ValueError("未能从文件中提取正文。请检查文件内容后重新上传。")
-    return text
+    return extract_raw_text_from_file(uploaded_file)
 
 
 def uploaded_file_size(uploaded_file) -> int:
@@ -311,6 +278,7 @@ def init_analysis_state() -> None:
         "selected_model_name": "deepseek-v4-flash",
         "estimated_time": "",
         "analysis_mode": "快速测试",
+        "use_enhanced_cleaning": False,
         "app_open_logged": False,
         "last_uploaded_signature": "",
     }
@@ -362,10 +330,11 @@ def model_display_name(model_name: str) -> str:
 def set_running_state(
     *,
     file_name: str,
-    analysis_text: str,
+    raw_text: str,
     top_k: int,
     quick_test_mode: bool,
     core_only: bool,
+    use_enhanced_cleaning: bool,
     original_text_length: int,
     upload_file_size: int,
     model_name: str,
@@ -386,12 +355,14 @@ def set_running_state(
     st.session_state.selected_model_name = model_name
     st.session_state.estimated_time = estimated_time
     st.session_state.analysis_mode = "快速测试" if quick_test_mode else "完整分析"
+    st.session_state.use_enhanced_cleaning = use_enhanced_cleaning
     st.session_state.pending_analysis = {
-        "analysis_text": analysis_text,
+        "raw_text": raw_text,
         "top_k": top_k,
         "title": file_name,
         "selected_label_names": selected_labels,
         "core_only": core_only,
+        "use_enhanced_cleaning": use_enhanced_cleaning,
         "quick_test_mode": quick_test_mode,
         "upload_file_size": upload_file_size,
         "original_text_length": original_text_length,
@@ -469,6 +440,7 @@ def render_running_panel() -> dict[str, Any]:
     model = st.session_state.get("selected_model_name") or get_deepseek_model()
     mode = st.session_state.get("analysis_mode") or "快速测试"
     estimated_time = st.session_state.get("estimated_time") or "正在估算"
+    cleaning_mode = "增强文本清洗" if st.session_state.get("use_enhanced_cleaning") else "标准文本处理"
 
     st.markdown(
         f"""
@@ -479,6 +451,7 @@ def render_running_panel() -> dict[str, Any]:
             <span class="status-pill">当前文件：{file_name}</span>
             <span class="status-pill">当前模型：{model_display_name(model)}</span>
             <span class="status-pill">当前模式：{mode}</span>
+            <span class="status-pill">文本处理：{cleaning_mode}</span>
             <span class="status-pill">预计耗时：{estimated_time}</span>
           </div>
         </div>
@@ -597,6 +570,15 @@ def render_upload_card(label_definitions: list[dict[str, Any]]) -> None:
             value=True,
             help="快速测试模式用于验证 API、召回和报告链路，耗时更短；正式分析可关闭该模式。",
         )
+        use_enhanced_cleaning = st.checkbox(
+            "启用增强文本清洗（实验）",
+            value=False,
+            help=(
+                "启用后，系统会在 RAG 分析前对 PDF 提取文本进行格式清洗与结构识别，"
+                "尽量去除页眉页脚、脚注、参考文献和乱码干扰。该功能不会改写论文内容，"
+                "但可能增加分析耗时。"
+            ),
+        )
         if quick_test_mode:
             top_k = st.slider(
                 "每个标签召回证据段落数量",
@@ -615,6 +597,8 @@ def render_upload_card(label_definitions: list[dict[str, Any]]) -> None:
             )
         if quick_test_mode:
             st.caption("快速测试模式仅分析：现代性批判、思想史研究、社会历史批评、历史唯物主义、启蒙理性。")
+        if use_enhanced_cleaning:
+            st.caption("增强文本清洗会先进行规则清洗，并可调用大模型逐块做结构识别；清洗失败时会自动回退。")
         core_only = st.toggle("证据链只展示分数 >= 2 的核心标签", value=True)
         st.caption(f"当前模型：{selected_model_name}")
         key_status, key_message = get_deepseek_key_status()
@@ -631,6 +615,10 @@ def render_upload_card(label_definitions: list[dict[str, Any]]) -> None:
             "请保持页面打开，不要重复点击提交。"
         )
         st.caption("边界：只分析论文文本呈现出的思想倾向，不判断作者本人真实政治立场。")
+        st.caption(
+            "隐私提示：当前版本用于原型测试。上传论文仅用于本次分析；如启用增强文本清洗或大模型分析，"
+            "系统会将相关文本片段发送至大模型 API。请勿上传涉密、未授权或不希望被第三方模型处理的文本。"
+        )
 
         if not uploaded_file:
             st.markdown("</div>", unsafe_allow_html=True)
@@ -655,14 +643,14 @@ def render_upload_card(label_definitions: list[dict[str, Any]]) -> None:
             return
 
         try:
-            text = parse_uploaded_file(uploaded_file)
+            raw_text = parse_uploaded_file(uploaded_file)
         except ValueError as exc:
             st.error(str(exc))
             st.markdown("</div>", unsafe_allow_html=True)
             return
 
-        original_text_length = len(text)
-        analysis_text = text[:MAX_ANALYSIS_CHARS]
+        original_text_length = len(raw_text)
+        preview_text = raw_text[:MAX_ANALYSIS_CHARS]
         estimated_time = estimate_analysis_time(selected_model_name, quick_test_mode, original_text_length)
         st.caption(f"已提取约 {original_text_length} 个字符。")
         if original_text_length > MAX_ANALYSIS_CHARS:
@@ -673,7 +661,7 @@ def render_upload_card(label_definitions: list[dict[str, Any]]) -> None:
                 "请保持页面打开，不要重复点击提交。"
             )
         with st.expander("查看前 1000 字预览", expanded=False):
-            st.text_area("正文预览", analysis_text[:1000], height=180)
+            st.text_area("正文预览", preview_text[:1000], height=180)
 
         if st.button("开始分析", type="primary", width="stretch"):
             if not get_deepseek_api_key():
@@ -694,10 +682,11 @@ def render_upload_card(label_definitions: list[dict[str, Any]]) -> None:
             )
             set_running_state(
                 file_name=uploaded_file.name,
-                analysis_text=analysis_text,
+                raw_text=raw_text,
                 top_k=top_k,
                 quick_test_mode=quick_test_mode,
                 core_only=core_only,
+                use_enhanced_cleaning=use_enhanced_cleaning,
                 original_text_length=original_text_length,
                 upload_file_size=file_size_bytes,
                 model_name=selected_model_name,
@@ -915,6 +904,40 @@ def render_analysis_tabs(
     st.markdown("</div>", unsafe_allow_html=True)
 
 
+def render_cleaning_summary(result: dict[str, Any]) -> None:
+    if not result.get("use_enhanced_cleaning"):
+        return
+    summary = result.get("cleaning_summary") or {}
+    if not summary:
+        st.info("已启用增强文本清洗，但暂无可展示的清洗摘要。")
+        return
+
+    method_map = {
+        "rule_based": "规则清洗",
+        "rule_based_plus_llm": "规则 + 大模型清洗",
+        "raw_fallback": "原文回退",
+    }
+    st.markdown("#### 文本清洗摘要")
+    cols = st.columns(3)
+    metrics = [
+        ("清洗方式", method_map.get(str(summary.get("cleaning_method")), str(summary.get("cleaning_method") or "未知"))),
+        ("原始文本字数", summary.get("raw_text_length", 0)),
+        ("清洗后字数", summary.get("cleaned_text_length", 0)),
+        ("删除噪声", summary.get("removed_noise_count", 0)),
+        ("疑似脚注", summary.get("possible_footnotes_count", 0)),
+        ("疑似参考文献", summary.get("possible_references_count", 0)),
+        ("清洗警告", summary.get("warnings_count", 0)),
+    ]
+    for index, (label, value) in enumerate(metrics):
+        with cols[index % 3]:
+            st.metric(label, value)
+    warnings = summary.get("warnings") or []
+    if warnings:
+        with st.expander("查看清洗警告", expanded=False):
+            for warning in warnings:
+                st.write(f"- {warning}")
+
+
 def run_pending_analysis(running_slots: dict[str, Any] | None = None) -> None:
     if st.session_state.get("analysis_status") != "running":
         return
@@ -938,8 +961,67 @@ def run_pending_analysis(running_slots: dict[str, Any] | None = None) -> None:
             running_slots,
         )
         selected_labels = pending.get("selected_label_names")
+        raw_text = str(pending.get("raw_text") or "")
+        use_enhanced_cleaning = bool(pending.get("use_enhanced_cleaning", False))
+        raw_for_analysis = raw_text[:MAX_ANALYSIS_CHARS]
+        analysis_text = raw_for_analysis
+        cleaning_summary: dict[str, Any] | None = None
+
+        if use_enhanced_cleaning:
+            update_progress_state(
+                {
+                    "progress": 0.04,
+                    "status": "正在进行增强文本清洗与结构识别",
+                    "stage": "text_preprocessing",
+                    "total": st.session_state.get("total_labels", 0),
+                },
+                running_slots,
+            )
+            try:
+                cleaning_result = build_cleaned_document(
+                    raw_for_analysis,
+                    use_llm_cleaning=True,
+                    model_name=str(pending.get("model_name") or get_deepseek_model()),
+                )
+                cleaning_summary = cleaning_result.to_summary()
+                cleaning_summary["raw_text_length"] = len(raw_text)
+                if len(raw_text) > MAX_ANALYSIS_CHARS:
+                    warnings = list(cleaning_summary.get("warnings") or [])
+                    warnings.append(f"当前 V0 为控制成本，仅对前 {MAX_ANALYSIS_CHARS:,} 字进行清洗和分析。")
+                    cleaning_summary["warnings"] = warnings[:8]
+                    cleaning_summary["warnings_count"] = int(cleaning_summary.get("warnings_count", 0) or 0) + 1
+                analysis_text = (cleaning_result.cleaned_text or "").strip()
+                if not analysis_text:
+                    raise ValueError("文本清洗后正文为空。")
+                if len(analysis_text) > MAX_ANALYSIS_CHARS:
+                    analysis_text = analysis_text[:MAX_ANALYSIS_CHARS]
+            except Exception as exc:
+                print(f"增强文本清洗失败，已回退到原始文本：{exc}", flush=True)
+                cleaning_summary = {
+                    "cleaning_method": "raw_fallback",
+                    "raw_text_length": len(raw_text),
+                    "cleaned_text_length": len(raw_for_analysis),
+                    "block_count": 0,
+                    "removed_noise_count": 0,
+                    "possible_footnotes_count": 0,
+                    "possible_references_count": 0,
+                    "warnings_count": 1,
+                    "warnings": [f"增强文本清洗失败，已回退到原始文本：{exc}"],
+                }
+                analysis_text = raw_for_analysis
+        else:
+            update_progress_state(
+                {
+                    "progress": 0.04,
+                    "status": "正在准备正文",
+                    "stage": "prepare_text",
+                    "total": st.session_state.get("total_labels", 0),
+                },
+                running_slots,
+            )
+
         result = analyze_text(
-            pending["analysis_text"],
+            analysis_text,
             top_k=int(pending.get("top_k", 3)),
             title=str(pending.get("title") or "用户上传论文"),
             save_outputs=True,
@@ -950,7 +1032,10 @@ def run_pending_analysis(running_slots: dict[str, Any] | None = None) -> None:
         result["core_only"] = bool(pending.get("core_only", True))
         result["quick_test_mode"] = bool(pending.get("quick_test_mode", False))
         result["upload_file_size"] = pending.get("upload_file_size", 0)
-        result["original_text_length"] = pending.get("original_text_length", len(pending["analysis_text"]))
+        result["original_text_length"] = pending.get("original_text_length", len(raw_text))
+        result["use_enhanced_cleaning"] = use_enhanced_cleaning
+        if cleaning_summary:
+            result["cleaning_summary"] = cleaning_summary
         duration_seconds = round(time.time() - float(pending.get("started_at") or time.time()), 2)
         result["duration_seconds"] = duration_seconds
 
@@ -1029,6 +1114,7 @@ def render_upload_result(label_definitions: list[dict[str, Any]]) -> None:
     paper_title = result.get("title", "用户上传论文")
     render_summary_judgement_card(label_results, paper_title)
     render_label_matrix(label_results, label_definitions)
+    render_cleaning_summary(result)
     render_analysis_tabs(
         label_results,
         label_definitions,
