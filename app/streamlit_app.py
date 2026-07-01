@@ -56,6 +56,7 @@ from scripts.usage_logger import log_event, read_usage_events, usage_summary  # 
 
 
 EXCEL_PATH = PROJECT_ROOT / "data" / "training" / "人文社科论文思想谱系训练数据模板_已补证据.xlsx"
+DEMO_TEXT_PATH = PROJECT_ROOT / "data" / "processed" / "P001_当代中国的思想状况与现代性问题_清洗正文.txt"
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 MODEL_OPTIONS = {
     "V4 Flash｜速度优先": "deepseek-v4-flash",
@@ -293,6 +294,7 @@ def init_analysis_state() -> None:
         "analysis_result": None,
         "report_markdown": "",
         "analysis_error": "",
+        "analysis_error_suggestions": [],
         "current_step": "等待上传论文",
         "progress_value": 0.0,
         "completed_labels": [],
@@ -321,6 +323,8 @@ def reset_analysis_state() -> None:
     st.session_state.analysis_result = None
     st.session_state.report_markdown = ""
     st.session_state.analysis_error = ""
+    st.session_state.analysis_error_suggestions = []
+    st.session_state.analysis_error_suggestions = []
     st.session_state.current_step = "等待上传论文"
     st.session_state.progress_value = 0.0
     st.session_state.completed_labels = []
@@ -331,6 +335,88 @@ def reset_analysis_state() -> None:
     st.session_state.estimated_time = ""
     st.session_state.analysis_mode = "快速测试"
     st.rerun()
+
+
+def read_demo_analysis_text() -> tuple[str, str]:
+    if DEMO_TEXT_PATH.exists():
+        return DEMO_TEXT_PATH.read_text(encoding="utf-8"), "示例论文：汪晖《当代中国的思想状况与现代性问题》"
+
+    papers, _, _ = read_demo_excel()
+    if not papers.empty and "paper_id" in papers.columns:
+        rows = papers[papers["paper_id"].astype(str).str.strip().eq("P001")]
+        if not rows.empty:
+            row = rows.iloc[0]
+            title = str(row.get("title", "当代中国的思想状况与现代性问题")).strip()
+            author = str(row.get("author", "汪晖")).strip()
+            full_text = row.get("full_text")
+            if not pd.isna(full_text) and str(full_text).strip():
+                return str(full_text).strip(), f"示例论文：{author}《{title}》"
+
+    raise ValueError("未找到内置示例论文正文。请确认 data/processed 中包含 P001 清洗正文。")
+
+
+def classify_analysis_error(exc: Exception) -> dict[str, Any]:
+    message = str(exc)
+    lower = message.lower()
+    if isinstance(exc, MissingAPIKeyError) or "api key" in lower or "deepseek_api_key" in lower:
+        return {
+            "message": "DeepSeek API Key 未配置或格式不正确，无法完成自动分析。",
+            "suggestions": [
+                "本地运行时请确认 PowerShell 环境变量已设置。",
+                "Streamlit Cloud 部署时请在 Secrets 中配置 DEEPSEEK_API_KEY。",
+                "不要把 API key 填在页面或提交到 GitHub。",
+            ],
+        }
+    if "pdf" in lower and ("解析失败" in message or "扫描" in message or "extract" in lower):
+        return {
+            "message": "PDF 正文提取失败，当前文件可能是扫描图片版或文本层质量较差。",
+            "suggestions": [
+                "请优先上传可复制文本版 PDF。",
+                "如果有 TXT / Word 版本，建议转换为 TXT 后上传。",
+                "可开启增强文本清洗后重试。",
+            ],
+        }
+    if "正文过短" in message or "文本过短" in message or "未能从正文" in message:
+        return {
+            "message": "提取到的正文太短，无法进行可靠分析。",
+            "suggestions": [
+                "请确认上传的是论文全文而不是摘要、封面或目录。",
+                "如果 PDF 提取失败，建议改用 TXT。",
+            ],
+        }
+    if "timeout" in lower or "超时" in message:
+        return {
+            "message": "DeepSeek 请求超时，分析没有在限定时间内完成。",
+            "suggestions": [
+                "建议先使用 V4 Flash 和快速测试模式。",
+                "稍后重试，或减少 top_k。",
+                "长文本可以先上传 TXT 并保留正文部分。",
+            ],
+        }
+    if "sentence" in lower or "embedding" in lower or "torch" in lower or "bge" in lower:
+        return {
+            "message": "Embedding 模型加载或向量生成失败。",
+            "suggestions": [
+                "本地请检查 sentence-transformers / torch 是否安装完整。",
+                "Streamlit Cloud 首次加载模型可能较慢，可稍后刷新重试。",
+            ],
+        }
+    if "deepseek" in lower or "调用失败" in message:
+        return {
+            "message": "DeepSeek 调用失败，可能是网络、模型名或服务端限流问题。",
+            "suggestions": [
+                "请确认 DEEPSEEK_MODEL 为 deepseek-v4-flash 或 deepseek-v4-pro。",
+                "如果使用 V4 Pro 较慢，可切换 V4 Flash。",
+                "稍后重试一次。",
+            ],
+        }
+    return {
+        "message": f"分析失败：{message}",
+        "suggestions": [
+            "请检查文件格式、网络连接和 DeepSeek 配置。",
+            "可以先用内置示例论文验证链路是否正常。",
+        ],
+    }
 
 
 def estimate_analysis_time(model_name: str, quick_test_mode: bool, text_length: int = 0) -> str:
@@ -531,16 +617,20 @@ def render_running_panel() -> dict[str, Any]:
 
 def render_error_panel() -> None:
     error = st.session_state.get("analysis_error") or "分析过程中发生未知错误。"
+    suggestions = st.session_state.get("analysis_error_suggestions") or []
     st.markdown(
         f"""
         <div class="error-card">
           <div class="section-title">分析失败</div>
-          <div class="subtle-text">{error}</div>
-          <div class="subtle-text" style="margin-top: 10px;">请检查 API key、文件格式或网络连接后重新分析。</div>
+          <div class="subtle-text">{html_lib.escape(str(error))}</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
+    if suggestions:
+        st.markdown("**建议处理：**")
+        for suggestion in suggestions:
+            st.write(f"- {suggestion}")
     if st.button("重新分析", type="primary"):
         reset_analysis_state()
 
@@ -645,6 +735,64 @@ def render_upload_card(label_definitions: list[dict[str, Any]]) -> None:
             "隐私提示：当前版本用于原型测试。上传论文仅用于本次分析；如启用增强文本清洗或大模型分析，"
             "系统会将相关文本片段发送至大模型 API。请勿上传涉密、未授权或不希望被第三方模型处理的文本。"
         )
+
+        st.markdown("---")
+        st.caption("没有文件也可以先体验完整链路。")
+        if st.button("试用示例论文", width="stretch"):
+            if not get_deepseek_api_key():
+                st.error("未配置 DEEPSEEK_API_KEY。请在本地环境变量或 Streamlit Cloud Secrets 中配置后再分析。")
+                st.markdown("</div>", unsafe_allow_html=True)
+                return
+            try:
+                demo_text, demo_title = read_demo_analysis_text()
+            except Exception as exc:
+                error_info = classify_analysis_error(exc)
+                st.error(error_info["message"])
+                for suggestion in error_info["suggestions"]:
+                    st.write(f"- {suggestion}")
+                st.markdown("</div>", unsafe_allow_html=True)
+                return
+            demo_text_length = len(demo_text)
+            demo_estimated_time = estimate_analysis_time(selected_model_name, quick_test_mode, demo_text_length)
+            log_event(
+                "file_uploaded",
+                {
+                    "file_type": "demo",
+                    "file_size_mb": 0,
+                    "text_length": demo_text_length,
+                },
+            )
+            log_event(
+                "analysis_started",
+                {
+                    "file_type": "demo",
+                    "file_size_mb": 0,
+                    "text_length": demo_text_length,
+                    "model_name": selected_model_name,
+                    "analysis_mode": mode_name,
+                    "top_k": top_k,
+                    "success": True,
+                },
+            )
+            set_running_state(
+                file_name=demo_title,
+                raw_text=demo_text,
+                top_k=top_k,
+                quick_test_mode=quick_test_mode,
+                core_only=core_only,
+                use_enhanced_cleaning=use_enhanced_cleaning,
+                original_text_length=demo_text_length,
+                upload_file_size=0,
+                model_name=selected_model_name,
+                estimated_time=demo_estimated_time,
+                file_type="demo",
+                extraction_metadata={
+                    "backend": "demo_txt",
+                    "backend_scores": {"demo_txt": 100},
+                    "backend_quality": {},
+                    "warnings": [],
+                },
+            )
 
         if not uploaded_file:
             st.markdown("</div>", unsafe_allow_html=True)
@@ -1258,6 +1406,7 @@ def run_pending_analysis(running_slots: dict[str, Any] | None = None) -> None:
         )
         st.rerun()
     except MissingAPIKeyError as exc:
+        error_info = classify_analysis_error(exc)
         duration_seconds = round(time.time() - float(pending.get("started_at") or time.time()), 2)
         log_event(
             "analysis_failed",
@@ -1271,14 +1420,16 @@ def run_pending_analysis(running_slots: dict[str, Any] | None = None) -> None:
                 "duration_seconds": duration_seconds,
                 "success": False,
                 "error_type": type(exc).__name__,
-                "error_message_short": str(exc),
+                "error_message_short": error_info["message"],
             },
         )
         st.session_state.analysis_status = "error"
-        st.session_state.analysis_error = str(exc)
+        st.session_state.analysis_error = error_info["message"]
+        st.session_state.analysis_error_suggestions = error_info["suggestions"]
         st.session_state.pending_analysis = None
         st.rerun()
     except Exception as exc:
+        error_info = classify_analysis_error(exc)
         duration_seconds = round(time.time() - float(pending.get("started_at") or time.time()), 2)
         log_event(
             "analysis_failed",
@@ -1292,11 +1443,12 @@ def run_pending_analysis(running_slots: dict[str, Any] | None = None) -> None:
                 "duration_seconds": duration_seconds,
                 "success": False,
                 "error_type": type(exc).__name__,
-                "error_message_short": str(exc),
+                "error_message_short": error_info["message"],
             },
         )
         st.session_state.analysis_status = "error"
-        st.session_state.analysis_error = f"分析失败：{exc}"
+        st.session_state.analysis_error = error_info["message"]
+        st.session_state.analysis_error_suggestions = error_info["suggestions"]
         st.session_state.pending_analysis = None
         st.rerun()
 
