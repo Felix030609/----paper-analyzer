@@ -9,6 +9,8 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from scripts.text_preprocessing import build_evidence_excerpt
+
 
 CATEGORY_LABELS = {
     "方法论标签": ["社会历史批评", "文本细读", "文学史研究", "思想史研究", "文化研究"],
@@ -1311,50 +1313,67 @@ def render_evidence_chain(label_results: list[dict[str, Any]]) -> None:
             if evidence_items:
                 display_items = [
                     {
-                        "text": evidence.get("evidence_text", ""),
+                        "evidence_id": evidence.get("evidence_id") or f"E{index}",
+                        "label_name": item.get("label_name", ""),
+                        "score": score,
+                        "excerpt_text": evidence.get("excerpt_text")
+                        or build_evidence_excerpt(evidence.get("evidence_text") or evidence.get("full_text") or ""),
+                        "full_text": evidence.get("full_text") or evidence.get("evidence_text", ""),
                         "reason": evidence.get("reason") or item.get("reason"),
                         "evidence_type": evidence.get("evidence_type", "证据"),
                         "confidence": evidence.get("confidence", confidence),
                         "chunk_index": evidence.get("chunk_index", ""),
                         "similarity": evidence.get("similarity_score", evidence.get("similarity", "")),
                     }
-                    for evidence in evidence_items
+                    for index, evidence in enumerate(evidence_items, start=1)
                 ]
             elif retrieved_items:
                 display_items = [
                     {
-                        "text": evidence.get("evidence_full_text") or evidence.get("text", ""),
+                        "evidence_id": evidence.get("evidence_id") or f"E{index}",
+                        "label_name": evidence.get("label_name") or item.get("label_name", ""),
+                        "score": evidence.get("score", score),
+                        "excerpt_text": evidence.get("excerpt_text")
+                        or evidence.get("evidence_excerpt")
+                        or build_evidence_excerpt(evidence.get("full_text") or evidence.get("evidence_full_text") or evidence.get("text", "")),
+                        "full_text": evidence.get("full_text") or evidence.get("evidence_full_text") or evidence.get("text", ""),
                         "reason": item.get("reason"),
                         "evidence_type": "语义召回段落",
                         "confidence": confidence,
                         "chunk_index": evidence.get("chunk_index", ""),
+                        "source_chunk_id": evidence.get("source_chunk_id") or evidence.get("chunk_id", ""),
+                        "page": evidence.get("page"),
                         "section_title": evidence.get("section_title", ""),
                         "similarity": evidence.get("similarity_score", evidence.get("similarity", "")),
                         "quality_score": evidence.get("quality_score", ""),
                         "raw_text_reference": evidence.get("raw_text_reference", ""),
                         "cleaned": True,
                     }
-                    for evidence in retrieved_items
+                    for index, evidence in enumerate(retrieved_items, start=1)
                 ]
             else:
                 display_items = [
                     {
-                        "text": str(text),
+                        "evidence_id": f"E{index}",
+                        "label_name": item.get("label_name", ""),
+                        "score": score,
+                        "excerpt_text": build_evidence_excerpt(text),
+                        "full_text": str(text),
                         "reason": item.get("reason"),
                         "evidence_type": "模型摘录",
                         "confidence": confidence,
                         "chunk_index": "",
                         "similarity": "",
                     }
-                    for text in (item.get("evidence") or [])
+                    for index, text in enumerate(item.get("evidence") or [], start=1)
                 ]
 
             if display_items:
                 if len(display_items) == 1 and len(retrieved_items) == 0:
                     st.caption("当前标签只召回到 1 条可展示证据。可提高 top_k 或切换 V4 Pro 重新分析。")
                 for index, evidence in enumerate(display_items, start=1):
-                    text = evidence.get("text", "")
-                    preview, has_more = truncate_text(text)
+                    excerpt = str(evidence.get("excerpt_text") or "").strip()
+                    full_text = str(evidence.get("full_text") or "").strip()
                     chunk_meta = f"｜chunk {evidence.get('chunk_index')}" if evidence.get("chunk_index") not in ("", None) else ""
                     section_meta = f"｜{evidence.get('section_title')}" if evidence.get("section_title") else ""
                     similarity_meta = f"｜相似度 {evidence.get('similarity')}" if evidence.get("similarity") not in ("", None) else ""
@@ -1362,19 +1381,28 @@ def render_evidence_chain(label_results: list[dict[str, Any]]) -> None:
                     st.markdown(
                         f"""
                         <div class="evidence-card">
-                          <div class="summary-label">原文证据 {index}{html_lib.escape(section_meta)}{html_lib.escape(chunk_meta)}{html_lib.escape(similarity_meta)}{html_lib.escape(quality_meta)}</div>
-                          <div class="evidence-block">{html_lib.escape(preview)}</div>
+                          <div class="summary-label">{html_lib.escape(str(evidence.get("evidence_id") or f"E{index}"))}｜{html_lib.escape(str(evidence.get("label_name") or item.get("label_name", "")))}｜{int(evidence.get("score") or score)}/3{html_lib.escape(section_meta)}{html_lib.escape(chunk_meta)}{html_lib.escape(similarity_meta)}{html_lib.escape(quality_meta)}</div>
+                          <div class="evidence-block">{html_lib.escape(excerpt)}</div>
                         </div>
                         """,
                         unsafe_allow_html=True,
                     )
                     if evidence.get("cleaned"):
                         st.caption("该证据为 PDF/TXT 提取文本清洗后的片段，已尽量去除页眉、页脚和乱码符号。")
-                    if has_more:
+                    if full_text and full_text != excerpt:
                         with st.expander("查看完整证据", expanded=False):
-                            st.write(text)
+                            st.write(full_text)
+                            meta_items = []
+                            if evidence.get("source_chunk_id"):
+                                meta_items.append(f"chunk_id：{evidence.get('source_chunk_id')}")
+                            if evidence.get("page") not in ("", None):
+                                meta_items.append(f"页码：{evidence.get('page')}")
+                            if evidence.get("section_title"):
+                                meta_items.append(f"章节：{evidence.get('section_title')}")
+                            if meta_items:
+                                st.caption("；".join(meta_items))
                     raw_reference = str(evidence.get("raw_text_reference") or "").strip()
-                    if raw_reference and raw_reference != str(text).strip():
+                    if raw_reference and raw_reference != full_text:
                         with st.expander("查看原始提取文本", expanded=False):
                             st.write(raw_reference)
                     reason = evidence.get("reason") or item.get("reason")

@@ -286,6 +286,73 @@ def normalize_chinese_spacing(text: str) -> str:
     return text
 
 
+def clean_text_for_evidence_display(text: str) -> str:
+    value = str(text or "")
+    value = PRIVATE_UNICODE_RE.sub("", value)
+    value = SUSPICIOUS_SYMBOL_RE.sub("", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    value = normalize_chinese_spacing(value)
+    return value
+
+
+def cut_near_sentence_boundary(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    window = text[:limit]
+    boundary = max(window.rfind(mark) for mark in ("。", "；", "，", "、"))
+    if boundary >= max(60, int(limit * 0.55)):
+        return window[: boundary + 1].strip()
+    return window.rstrip()
+
+
+def build_evidence_excerpt(text: str, max_chars: int = 250) -> str:
+    cleaned = clean_text_for_evidence_display(text)
+    if len(cleaned) <= max_chars:
+        return cleaned
+
+    logic_words = ("首先", "其次", "再次", "因此", "然而", "但是", "由此", "可见", "综上")
+    sentences = [item.strip() for item in re.split(r"(?<=[。！？；])", cleaned) if item.strip()]
+    if not sentences:
+        head_limit = max_chars - 1
+        return cut_near_sentence_boundary(cleaned, head_limit).rstrip("，；、") + "…"
+
+    selected: list[str] = []
+    if sentences:
+        selected.append(sentences[0])
+    for sentence in sentences[1:-1]:
+        if any(word in sentence for word in logic_words):
+            selected.append(sentence)
+        if len("".join(selected)) >= max_chars * 0.65:
+            break
+    if len(sentences) > 1 and sentences[-1] not in selected:
+        selected.append(sentences[-1])
+
+    candidate = "".join(selected)
+    if len(candidate) <= max_chars:
+        if candidate != cleaned and "……" not in candidate:
+            if len(selected) >= 2:
+                candidate_with_gap = selected[0] + "……" + "".join(selected[1:])
+            else:
+                candidate_with_gap = candidate.rstrip("，；、") + "……"
+            if len(candidate_with_gap) <= max_chars:
+                return candidate_with_gap
+        return candidate
+
+    ellipsis = "……"
+    tail_budget = max(60, int(max_chars * 0.38))
+    head_budget = max_chars - len(ellipsis) - tail_budget
+    head = cut_near_sentence_boundary(cleaned, head_budget).rstrip("，；、")
+    tail_source = cleaned[-tail_budget:]
+    tail_boundary = min(
+        [pos for pos in (tail_source.find(mark) for mark in ("。", "；", "，")) if pos >= 0] or [0]
+    )
+    tail = tail_source[tail_boundary:].lstrip("，；、。 ")
+    excerpt = f"{head}{ellipsis}{tail}".strip()
+    if len(excerpt) > max_chars:
+        excerpt = excerpt[: max_chars - 1].rstrip("，；、") + "…"
+    return excerpt
+
+
 def normalize_punctuation_for_chinese_line(line: str) -> str:
     if re.search(r"https?://|www\.|DOI\s*[:：]?\s*10\.|[A-Za-z]\.[A-Za-z]", line, re.I):
         return line

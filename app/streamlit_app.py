@@ -47,6 +47,7 @@ from scripts.deepseek_client import (  # noqa: E402
 )
 from scripts.report_export import markdown_to_pdf_bytes  # noqa: E402
 from scripts.text_preprocessing import (  # noqa: E402
+    build_evidence_excerpt,
     build_cleaned_document,
     extract_raw_text_from_file,
     extract_text_with_multiple_backends,
@@ -145,9 +146,13 @@ def p001_label_results(
         p001_evidence = evidence[evidence["paper_id"].astype(str).str.strip().eq("P001")]
         for _, row in p001_evidence.iterrows():
             label = normalize_label_name(row.get("label", ""))
+            full_text = str(row.get("evidence_text", "") or "").strip()
             evidence_by_label.setdefault(label, []).append(
                 {
-                    "evidence_text": str(row.get("evidence_text", "") or "").strip(),
+                    "evidence_text": full_text,
+                    "excerpt_text": build_evidence_excerpt(full_text),
+                    "full_text": full_text,
+                    "raw_text_reference": full_text,
                     "reason": str(row.get("reason", "") or "").strip(),
                     "evidence_type": str(row.get("evidence_type", "证据") or "证据").strip(),
                     "confidence": row.get("confidence", ""),
@@ -187,7 +192,20 @@ def p001_label_results(
                 "reason": reason,
                 "uncertainty": "样本标注仍需结合全文语境复核。",
                 "retrieved_paragraphs": [
-                    {"rank": index + 1, "similarity": "示例证据", "text": item["evidence_text"]}
+                    {
+                        "evidence_id": f"E{index + 1}",
+                        "label_name": raw_label,
+                        "score": score,
+                        "rank": index + 1,
+                        "similarity": "示例证据",
+                        "excerpt_text": item["excerpt_text"],
+                        "full_text": item["full_text"],
+                        "raw_text_reference": item["raw_text_reference"],
+                        "source_chunk_id": "",
+                        "page": None,
+                        "section_title": None,
+                        "text": item["excerpt_text"],
+                    }
                     for index, item in enumerate(evidence_items[:3])
                     if item["evidence_text"]
                 ],

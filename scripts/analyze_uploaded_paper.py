@@ -16,7 +16,12 @@ from scripts.deepseek_client import (
     get_deepseek_api_key,
     get_deepseek_model,
 )
-from scripts.text_preprocessing import CNKI_NOISE_RE, evaluate_text_quality, count_chinese
+from scripts.text_preprocessing import (
+    CNKI_NOISE_RE,
+    build_evidence_excerpt,
+    count_chinese,
+    evaluate_text_quality,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -29,7 +34,7 @@ MAX_TOP_K = 8
 MAX_LLM_EVIDENCE_PER_LABEL = 8
 MAX_EVIDENCE_CHARS = 800
 MAX_VISIBLE_EVIDENCE_CHARS = 1200
-MAX_REPORT_EVIDENCE_CHARS = 500
+MAX_REPORT_EVIDENCE_CHARS = 250
 MAX_REPORT_REASON_CHARS = 500
 QUICK_TEST_LABELS = ["现代性批判", "思想史研究", "社会历史批评", "历史唯物主义", "启蒙理性"]
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -73,16 +78,30 @@ def normalize_label_result(
         evidence = [evidence]
     if not isinstance(evidence, list):
         evidence = []
+    score = clamp_int(raw.get("score"), 0, 3, 0)
+    label_name = label_definition["label_name"]
+    normalized_retrieved = []
+    for index, item in enumerate(retrieved, start=1):
+        evidence_item = dict(item)
+        evidence_item.setdefault("evidence_id", f"E{index}")
+        evidence_item["label_name"] = label_name
+        evidence_item["score"] = score
+        evidence_item.setdefault("excerpt_text", build_evidence_excerpt(evidence_item.get("full_text") or evidence_item.get("text", "")))
+        evidence_item.setdefault("full_text", evidence_item.get("text", ""))
+        evidence_item.setdefault("source_chunk_id", evidence_item.get("chunk_id", ""))
+        evidence_item.setdefault("page", None)
+        evidence_item.setdefault("section_title", evidence_item.get("section_title") or None)
+        normalized_retrieved.append(evidence_item)
 
     return {
-        "label_name": label_definition["label_name"],
+        "label_name": label_name,
         "category": label_definition["category"],
-        "score": clamp_int(raw.get("score"), 0, 3, 0),
+        "score": score,
         "confidence": clamp_int(raw.get("confidence"), 1, 5, 1),
         "evidence": [str(item).strip() for item in evidence[:3] if str(item).strip()],
         "reason": str(raw.get("reason", "")).strip() or "DeepSeek 未返回明确理由。",
         "uncertainty": str(raw.get("uncertainty", "")).strip() or "需要人工复核。",
-        "retrieved_paragraphs": retrieved,
+        "retrieved_paragraphs": normalized_retrieved,
     }
 
 
@@ -345,10 +364,16 @@ def retrieve_label_evidence(
     for rank, index in enumerate(final_indices, start=1):
         chunk = chunks[int(index)] if int(index) < len(chunks) else {}
         full_text = str(chunk.get("cleaned_text") or paragraphs[index])
+        raw_reference = str(chunk.get("raw_text_reference") or full_text)
+        excerpt_text = build_evidence_excerpt(full_text, max_chars=MAX_REPORT_EVIDENCE_CHARS)
         results.append(
             {
+                "evidence_id": f"E{rank}",
+                "label_name": str(label_definition.get("label_name", "")),
+                "score": None,
                 "rank": rank,
                 "chunk_id": chunk.get("chunk_id") or f"C{int(index) + 1:03d}",
+                "source_chunk_id": chunk.get("chunk_id") or f"C{int(index) + 1:03d}",
                 "chunk_index": int(chunk.get("chunk_index") or int(index) + 1),
                 "section_title": chunk.get("section_title", ""),
                 "start_char": chunk.get("start_char"),
@@ -357,12 +382,15 @@ def retrieve_label_evidence(
                 "is_reference": bool(chunk.get("is_reference", False)),
                 "quality_score": chunk.get("quality_score"),
                 "warnings": chunk.get("warnings", []),
-                "raw_text_reference": shorten_text(str(chunk.get("raw_text_reference") or full_text), MAX_VISIBLE_EVIDENCE_CHARS),
+                "raw_text_reference": raw_reference,
                 "similarity": round(float(similarities[index]), 4),
                 "similarity_score": round(float(similarities[index]), 4),
-                "text": shorten_text(full_text, MAX_EVIDENCE_CHARS),
-                "evidence_excerpt": shorten_text(full_text, MAX_EVIDENCE_CHARS),
-                "evidence_full_text": shorten_text(full_text, MAX_VISIBLE_EVIDENCE_CHARS),
+                "page": None,
+                "text": excerpt_text,
+                "excerpt_text": excerpt_text,
+                "evidence_excerpt": excerpt_text,
+                "full_text": full_text,
+                "evidence_full_text": full_text,
             }
         )
     return results
@@ -404,7 +432,7 @@ def score_label_with_deepseek(
                 "rank": item.get("rank"),
                 "chunk_index": item.get("chunk_index"),
                 "similarity": item.get("similarity"),
-                "text": item.get("evidence_excerpt") or item.get("text", ""),
+                "text": item.get("full_text") or item.get("evidence_full_text") or item.get("text", ""),
             }
             for item in retrieved
         ],
@@ -449,16 +477,26 @@ def generate_markdown_report(
     title: str = "用户上传论文",
     model_name: str | None = None,
 ) -> str:
+    def report_evidence_for_label(item: dict[str, Any]) -> list[str]:
+        retrieved = item.get("retrieved_paragraphs") or []
+        if retrieved:
+            return [
+                f"[{evidence.get('evidence_id') or f'E{index}'}] {evidence.get('excerpt_text') or build_evidence_excerpt(evidence.get('full_text') or evidence.get('text', ''), MAX_REPORT_EVIDENCE_CHARS)}"
+                for index, evidence in enumerate(retrieved[:3], start=1)
+                if (evidence.get("excerpt_text") or evidence.get("full_text") or evidence.get("text"))
+            ]
+        return [
+            build_evidence_excerpt(evidence, MAX_REPORT_EVIDENCE_CHARS)
+            for evidence in item.get("evidence", [])[:3]
+        ]
+
     compact_results = [
         {
             "label_name": item["label_name"],
             "category": item["category"],
             "score": item["score"],
             "confidence": item["confidence"],
-            "evidence": [
-                shorten_text(evidence, MAX_REPORT_EVIDENCE_CHARS)
-                for evidence in item.get("evidence", [])[:3]
-            ],
+            "evidence": report_evidence_for_label(item),
             "reason": shorten_text(item.get("reason", ""), MAX_REPORT_REASON_CHARS),
             "uncertainty": shorten_text(item.get("uncertainty", ""), 300),
         }
@@ -480,6 +518,8 @@ def generate_markdown_report(
 
 产品边界声明必须明确写出：
 本工具只分析论文文本中呈现出的思想倾向，不判断作者本人真实政治立场。
+
+证据引用只能使用提供的 250 字以内 evidence 摘录，不要扩写为完整 chunk，也不要补写原文没有的内容。
 
 标签分析结果：
 {json.dumps(compact_results, ensure_ascii=False, indent=2)}
