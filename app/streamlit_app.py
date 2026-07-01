@@ -850,14 +850,19 @@ def render_done_page(label_definitions: list[dict[str, Any]]) -> None:
     if not result:
         st.warning("暂无分析结果，请重新上传论文。")
         return
-    main_col, side_col = st.columns([1.5, 0.75], gap="large")
-    with main_col:
+    summary_col, action_col = st.columns([1.7, 0.9], gap="large")
+    with summary_col:
         render_result_summary_card(result)
+    with action_col:
+        render_compact_analysis_summary("done")
+
+    st.divider()
+    st.markdown('<div class="full-width-section result-section">', unsafe_allow_html=True)
+    with st.container():
         render_analysis_results_tabs(result, label_definitions)
         if result.get("save_warning"):
             st.warning(result["save_warning"])
-    with side_col:
-        render_compact_analysis_summary("done")
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def render_error_page() -> None:
